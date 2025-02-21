@@ -1,0 +1,259 @@
+import datetime
+import random
+from enum import Enum
+import numpy as np
+from scipy import stats
+from typing import Dict, Tuple, List
+
+class InsufficientBatteryError(Exception):
+    pass
+
+class InvalidSourceError(ValueError):
+    pass
+
+class ContaminantsExceedSafetyThresholdsError(Exception):
+    def __init__(self, output_contaminants, message="Output water contaminants exceed safety thresholds"):
+        self.output_contaminants = output_contaminants
+        super().__init__(message)
+
+class MissingInputContaminantsError(ValueError):
+    pass
+
+class OperatingMode(Enum):
+    ECO = 'eco'
+    STANDARD = 'standard'
+    HIGH_PERFORMANCE = 'high_performance'
+
+class WaterSource(Enum):
+    SEAWATER = 'seawater'
+    CONTAMINATED = 'contaminated'
+    AIR = 'air'
+
+class AquaSphere:
+    DEFAULT_CONFIG = {
+        'removal_efficiencies': {
+            'salt': 0.99, 'bacteria': 0.999, 'heavy_metals': 0.95,
+            'debris': 0.98, 'insects': 0.995  # New contaminants
+        },
+        'safety_thresholds': {
+            'salt': 0.5, 'bacteria': 0, 'heavy_metals': 0.01,
+            'debris': 0.1, 'insects': 0  # g/L for debris, count/mL for insects
+        },
+        'eco_mode_efficiency_reduction': 0.8,
+        'eco_mode_removal_reduction': 0.9,
+        'high_performance_mode_efficiency_increase': 1.3,
+        'high_performance_mode_removal_increase': 1.05,
+    }
+
+    def __init__(self, solar_panel_power: float = 50, solar_efficiency: float = 0.2, battery_capacity: float = 100,
+                 filtration_rate: float = 10, energy_per_liter: float = 0.5, filter_capacity_liters: float = 1000):
+        """Initialize the AquaSphere gadget."""
+        # Core attributes (units: hourly)
+        self.solar_panel_power_watts = solar_panel_power  # Watts
+        self.solar_efficiency = solar_efficiency  # 0 to 1
+        self.battery_capacity_wh = battery_capacity  # Watt-hours
+        self.battery_level_wh = battery_capacity / 2  # Start at 50% charge
+        self.filtration_rate_lph = filtration_rate  # Liters per hour
+        self.energy_per_liter_wh = energy_per_liter  # Watt-hours per liter
+        self.filter_capacity_liters = filter_capacity_liters  # Total filter lifespan
+        self.filter_usage_liters = 0  # Liters processed
+        self.battery_cycles = 0  # Charging cycles
+        self.min_battery_level_wh = 5  # Minimum reserve
+        self.operation_log = []  # Event log
+
+        # Physical modeling
+        self.peukert_constant = 1.2  # Li-ion battery discharge
+        self.rated_current = 5  # Amperes
+        self.pipe_diameter = 0.05  # Meters
+        self.pipe_length = 1  # Meters
+        self.kinematic_viscosity = 1e-6  # m^2/s (water at 25°C)
+        self.roughness_ratio = 0.0015  # Plastic pipes
+
+        # Reaction rates for contaminant removal
+        self.reaction_rates = {
+            'salt': 0.1, 'bacteria': 0.5, 'heavy_metals': 0.3,
+            'debris': 0.2, 'insects': 0.4
+        }
+
+        # Operating mode
+        self.operating_mode = OperatingMode.STANDARD
+
+        # Maintenance models (Weibull: shape, scale)
+        self.filter_weibull = stats.weibull_min(c=2, scale=1500)  # Liters
+        self.battery_weibull = stats.weibull_min(c=1.5, scale=500)  # Cycles
+
+    def set_operating_mode(self, mode: OperatingMode):
+        """Set the operating mode."""
+        self.operating_mode = mode
+
+    def charge_battery(self, sunlight_hours: float, light_intensity: float = 1.0, temperature: float = 25) -> float:
+        """Charge the battery with solar energy, adjusting for temperature."""
+        if sunlight_hours <= 0:
+            return 0
+        # Solar efficiency drops 0.5% per °C above 25°C, increases below
+        temp_factor = 1 - 0.005 * (temperature - 25)
+        energy_generated = (self.solar_panel_power_watts * self.solar_efficiency *
+                           sunlight_hours * light_intensity * max(0.7, temp_factor))
+        # Peukert's law adjustment
+        discharge_rate = energy_generated / sunlight_hours / self.rated_current
+        effective_capacity = self.battery_capacity_wh * (self.rated_current / discharge_rate) ** (self.peukert_constant - 1)
+        charge_added = min(effective_capacity - self.battery_level_wh, energy_generated)
+        self.battery_level_wh = min(effective_capacity, self.battery_level_wh + charge_added)
+        self.battery_cycles += sunlight_hours / 24  # Approximate cycles
+        self._log_event("Battery charged", {'energy_added': charge_added, 'temperature': temperature})
+        return charge_added
+
+    def purify_water(self, source: WaterSource, input_contaminants: Dict[str, float] = None,
+                    humidity: float = None, temperature: float = 25) -> Tuple[float, Dict[str, float]]:
+        """Purify water from the specified source."""
+        if self.battery_level_wh < self.min_battery_level_wh:
+            raise InsufficientBatteryError("Battery level too low to operate.")
+
+        temp_factor = 1 - 0.003 * (temperature - 25)  # Filtration efficiency adjustment
+        filter_health = max(0, 1 - self.filter_usage_liters / self.filter_capacity_liters)
+
+        mode_factor = {
+            OperatingMode.ECO: self.DEFAULT_CONFIG['eco_mode_efficiency_reduction'],
+            OperatingMode.STANDARD: 1.0,
+            OperatingMode.HIGH_PERFORMANCE: self.DEFAULT_CONFIG['high_performance_mode_efficiency_increase']
+        }[self.operating_mode]
+
+        if source in [WaterSource.SEAWATER, WaterSource.CONTAMINATED]:
+            if not input_contaminants:
+                raise MissingInputContaminantsError("Input contaminants required.")
+            energy_required = self.energy_per_liter_wh * (1.5 if source == WaterSource.SEAWATER else 1.0) / mode_factor
+            output_contaminants = self._calculate_output_contaminants(input_contaminants, filter_health, temp_factor)
+            self._verify_safety_standards(output_contaminants)
+            water_produced, energy_used = self._calculate_water_production(energy_required)
+
+        elif source == WaterSource.AIR:
+            if humidity is None:
+                raise ValueError("Humidity required for air source.")
+            water_produced, energy_used, output_contaminants = self._purify_air(humidity, temperature, mode_factor)
+
+        else:
+            raise InvalidSourceError(f"Invalid source: {source}")
+
+        self.battery_level_wh -= energy_used
+        self.filter_usage_liters += water_produced
+        self._log_event("Water purified", {'source': source.value, 'water_produced': water_produced,
+                                           'energy_used': energy_used, 'output_contaminants': output_contaminants})
+        return water_produced, output_contaminants
+
+    def _calculate_output_contaminants(self, input_contaminants: Dict[str, float], filter_health: float,
+                                      temp_factor: float) -> Dict[str, float]:
+        """Calculate output contaminant levels."""
+        output = {}
+        residence_time = self.filter_capacity_liters / self.filtration_rate_lph
+        mode_removal = {
+            OperatingMode.ECO: self.DEFAULT_CONFIG['eco_mode_removal_reduction'],
+            OperatingMode.STANDARD: 1.0,
+            OperatingMode.HIGH_PERFORMANCE: self.DEFAULT_CONFIG['high_performance_mode_removal_increase']
+        }[self.operating_mode]
+        for contaminant, level in input_contaminants.items():
+            rate = self.reaction_rates.get(contaminant, 0.1)
+            removal = 1 - np.exp(-rate * residence_time * filter_health * temp_factor * mode_removal)
+            output[contaminant] = level * (1 - removal)
+        return output
+
+    def _calculate_water_production(self, energy_required: float) -> Tuple[float, float]:
+        """Calculate water produced and energy used."""
+        available_energy = self.battery_level_wh - self.min_battery_level_wh
+        max_water = available_energy / energy_required
+        flow_rate = self._calculate_flow_rate(100000)  # Example pressure diff (Pa)
+        water_produced = min(flow_rate, self.filtration_rate_lph, max_water)
+        energy_used = water_produced * energy_required
+        return water_produced, energy_used
+
+    def _calculate_flow_rate(self, pressure_diff: float) -> float:
+        """Calculate flow rate using simplified Darcy-Weisbach."""
+        f = 0.02  # Friction factor (simplified)
+        return np.sqrt((2 * self.pipe_diameter * 9.81 * pressure_diff) / (f * self.pipe_length))
+
+    def _purify_air(self, humidity: float, temperature: float, mode_factor: float) -> Tuple[float, float, Dict]:
+        """Extract and purify water from air."""
+        extraction_rate = humidity * 0.1 * (1 - 0.002 * (temperature - 25))  # Liters per hour
+        energy_required = 1.0 / mode_factor  # Wh per liter
+        max_water = (self.battery_level_wh - self.min_battery_level_wh) / energy_required
+        water_produced = min(extraction_rate, self.filtration_rate_lph, max_water)
+        energy_used = water_produced * energy_required
+        return water_produced, energy_used, {k: 0 for k in self.DEFAULT_CONFIG['safety_thresholds']}
+
+    def _verify_safety_standards(self, output_contaminants: Dict[str, float]):
+        """Check if output meets safety standards."""
+        for contaminant, threshold in self.DEFAULT_CONFIG['safety_thresholds'].items():
+            if output_contaminants.get(contaminant, 0) > threshold:
+                raise ContaminantsExceedSafetyThresholdsError(output_contaminants)
+
+    def _log_event(self, event: str, details: Dict):
+        """Log an event with timestamp."""
+        self.operation_log.append({
+            'timestamp': datetime.datetime.now(),
+            'event': event,
+            'details': details
+        })
+
+    def forecast_production(self, days: int, avg_sunlight_hours: float, avg_temperature: float = 25,
+                           water_source: WaterSource = WaterSource.CONTAMINATED, humidity: float = None) -> Dict:
+        """Forecast water production over days."""
+        sunlight = np.full(days, avg_sunlight_hours)
+        temperatures = np.full(days, avg_temperature)
+        energy_generated = self._vectorized_charge(sunlight, temperatures)
+        water_produced = self._vectorized_purify(energy_generated, water_source, humidity)
+        return {
+            'total_water_produced': np.sum(water_produced),
+            'avg_daily_production': np.mean(water_produced),
+            'daily_production': water_produced.tolist(),
+            'end_battery_level': self.battery_level_wh,
+            'end_filter_health': (1 - self.filter_usage_liters / self.filter_capacity_liters) * 100
+        }
+
+    def _vectorized_charge(self, sunlight_hours: np.ndarray, temperatures: np.ndarray) -> np.ndarray:
+        """Vectorized charging calculation."""
+        temp_factor = 1 - 0.005 * (temperatures - 25)
+        return self.solar_panel_power_watts * self.solar_efficiency * sunlight_hours * temp_factor
+
+    def _vectorized_purify(self, available_energy: np.ndarray, water_source: WaterSource, humidity: float = None) -> np.ndarray:
+        """Vectorized purification calculation."""
+        if water_source == WaterSource.AIR and humidity is not None:
+            return available_energy * 0.1 * (humidity / 100)
+        energy_per_liter = self.energy_per_liter_wh * (1.5 if water_source == WaterSource.SEAWATER else 1.0)
+        return available_energy / energy_per_liter
+
+    def maintenance_check(self) -> Dict:
+        """Check maintenance needs using Weibull distributions."""
+        status = {
+            'filter_usage': self.filter_usage_liters,
+            'battery_cycles': self.battery_cycles,
+            'maintenance_needed': [],
+            'filter_failure_probability': self.filter_weibull.cdf(self.filter_usage_liters),
+            'battery_failure_probability': self.battery_weibull.cdf(self.battery_cycles)
+        }
+        if status['filter_failure_probability'] > 0.7:
+            status['maintenance_needed'].append('filter_replacement_urgent')
+        elif status['filter_failure_probability'] > 0.5:
+            status['maintenance_needed'].append('filter_replacement_soon')
+        if status['battery_failure_probability'] > 0.7:
+            status['maintenance_needed'].append('battery_replacement_urgent')
+        elif status['battery_failure_probability'] > 0.5:
+            status['maintenance_needed'].append('battery_replacement_soon')
+        return status
+
+    def status(self) -> Dict:
+        """Return current status."""
+        return {
+            'battery_level_wh': self.battery_level_wh,
+            'filter_usage_liters': self.filter_usage_liters,
+            'operating_mode': self.operating_mode.value
+        }
+
+if __name__ == "__main__":
+    device = AquaSphere()
+    print("Initial Status:", device.status())
+    device.charge_battery(5, temperature=30)
+    print("After Charging:", device.status())
+    water, contaminants = device.purify_water(WaterSource.SEAWATER, {'salt': 35, 'debris': 1.0, 'insects': 10})
+    print(f"Seawater: {water:.2f} liters, Contaminants: {contaminants}")
+    forecast = device.forecast_production(7, 5.5, 26, WaterSource.CONTAMINATED)
+    print(f"7-day Forecast: {forecast['total_water_produced']:.2f} liters")
+    print("Maintenance:", device.maintenance_check())
