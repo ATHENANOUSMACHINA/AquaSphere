@@ -1,0 +1,4 @@
+from aquasphere import AquaSphere, WaterSource
+device = AquaSphere()
+water, contaminants = device.purify_water(WaterSource.SEAWATER, {'salt': 35})
+print(f"Produced {water:.2f} liters")
